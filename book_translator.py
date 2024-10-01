@@ -106,14 +106,15 @@ def extract_text_from_pdf(pdf_path: str) -> str:
         
         full_text = ""
         for page in extracted_data:
-            full_text += preprocess_arabic_text(page['text']) + "\n\n"
+            full_text += preprocess_arabic_text(page['text']) + "\f"  # Add form feed character between pages
         
         # If the extracted text is too short or contains many non-Arabic characters, fall back to OCR
         if len(full_text.strip()) < 100 or len(re.findall(r'[a-zA-Z]', full_text)) > len(full_text) * 0.5:
             logging.info("Extracted text may be incorrect. Falling back to OCR...")
             full_text = ocr_pdf_with_arabic(pdf_path)
         
-        logging.info(f"Extracted text: {full_text[:100]}...")  # Log first 100 characters
+        logging.info(f"Extracted {len(full_text.split('\f'))} pages from PDF")
+        logging.info(f"Sample of extracted text: {full_text[:1000]}...")  # Log first 1000 characters
         return full_text
     except Exception as e:
         logging.error(f"Failed to extract text from PDF: {e}")
