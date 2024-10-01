@@ -1,0 +1,8 @@
+.venv_PGT/
+.env
+config.json
+*.pdf
+*.docx
+*.txt
+!requirements.txt
+__pycache__/

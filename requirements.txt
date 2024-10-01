@@ -1,0 +1,9 @@
+PyPDF2
+openai
+python-docx
+reportlab
+tqdm
+aiohttp
+requests
+google-generativeai
+pdfminer
