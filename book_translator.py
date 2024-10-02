@@ -258,7 +258,7 @@ async def openai_translate(text: str, source_lang: str = 'Arabic', target_lang: 
     try:
         completion = await asyncio.to_thread(
             client.chat.completions.create,
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": f"You are an expert translator specializing in "
                                               f"{source_lang} to {target_lang} translations. "
