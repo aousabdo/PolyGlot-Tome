@@ -2,30 +2,14 @@ import os
 import argparse
 import logging
 import openai
-import requests
 import asyncio
 import aiohttp
 from typing import List
-from PyPDF2 import PdfReader
-from docx import Document
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter
-import io
-import time
 import re
+import time
 from tqdm.asyncio import tqdm_asyncio
 import json
 import google.generativeai as genai
-import pytesseract
-from PIL import Image
-from pdf2image import convert_from_path
-
-from multilingual_pdf2text.pdf2text import PDF2Text
-from multilingual_pdf2text.models.document_model.document import Document as PDF2TextDocument
-
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
-
-# Add these at the top of your file, after the other imports
 from asyncio import Semaphore
 from collections import defaultdict
 from openai import OpenAI
@@ -50,8 +34,9 @@ GOOGLE_GEMINI_API_KEY = config.get('GOOGLE_GEMINI_API_KEY')
 ANTHROPIC_API_KEY = config.get('ANTHROPIC_API_KEY')
 
 # Configure Gemini API
-genai.configure(api_key=os.environ["GOOGLE_GEMINI_API_KEY"])
-model = genai.GenerativeModel("gemini-1.5-pro-exp-0827")
+if GOOGLE_GEMINI_API_KEY:
+    genai.configure(api_key=GOOGLE_GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel("gemini-1.5-pro-exp-0827")
 
 # Validate API keys
 if not OPENAI_API_KEY:
@@ -62,69 +47,13 @@ if not ANTHROPIC_API_KEY:
     logging.warning("Claude Sonnet API key is missing.")
 
 # Set up OpenAI API key
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
+openai.api_key = OPENAI_API_KEY
 
 def is_text_readable(text: str, threshold: float = 0.7) -> bool:
     if not text:
         return False
     ascii_chars = sum(1 for c in text if ord(c) < 128)
     return ascii_chars / len(text) > threshold
-
-def ocr_pdf(pdf_path: str) -> str:
-    try:
-        images = convert_from_path(pdf_path)
-        text = ""
-        for image in images:
-            text += pytesseract.image_to_string(image, lang='ara+eng')
-        return text
-    except Exception as e:
-        logging.error(f"OCR failed: {e}")
-        raise
-
-def preprocess_arabic_text(text: str) -> str:
-    # Remove non-Arabic characters and normalize Arabic text
-    arabic_pattern = re.compile(r'[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]+')
-    arabic_text = ' '.join(arabic_pattern.findall(text))
-    return arabic_text
-
-def ocr_pdf_with_arabic(pdf_path: str) -> str:
-    images = convert_from_path(pdf_path)
-    full_text = ""
-    for image in images:
-        # Specify multiple languages, with Arabic as primary
-        text = pytesseract.image_to_string(image, lang='ara+eng', config='--psm 6')
-        full_text += preprocess_arabic_text(text) + "\n\n"
-    return full_text
-
-
-def extract_text_from_pdf(pdf_path: str) -> str:
-    if not os.path.exists(pdf_path):
-        raise FileNotFoundError(f"The file {pdf_path} does not exist.")
-    try:
-        # Try using multilingual_pdf2text first
-        pdf_document = PDF2TextDocument(
-            document_path=pdf_path,
-            language='ara'
-        )
-        pdf2text = PDF2Text(document=pdf_document)
-        extracted_data = pdf2text.extract()
-        
-        full_text = ""
-        for page in extracted_data:
-            full_text += preprocess_arabic_text(page['text']) + "\f"  # Add form feed character between pages
-        
-        # If the extracted text is too short or contains many non-Arabic characters, fall back to OCR
-        if len(full_text.strip()) < 100 or len(re.findall(r'[a-zA-Z]', full_text)) > len(full_text) * 0.5:
-            logging.info("Extracted text may be incorrect. Falling back to OCR...")
-            full_text = ocr_pdf_with_arabic(pdf_path)
-        
-        page_count = full_text.count('\f') + 1  # Count form feed characters and add 1
-        logging.info(f"Extracted {page_count} pages from PDF")
-        logging.info(f"Sample of extracted text: {full_text[:1000]}...")  # Log first 1000 characters
-        return full_text
-    except Exception as e:
-        logging.error(f"Failed to extract text from PDF: {e}")
-        raise
 
 def split_text_into_sentences(text: str) -> List[str]:
     sentence_endings = re.compile(r'(?<=[.!?])\s+')
@@ -153,7 +82,7 @@ def chunk_text(sentences: List[str], max_tokens: int, overlap: int = 1) -> List[
 
     return chunks
 
-# Add this class for rate limiting
+# Rate limiter class
 class RateLimiter:
     def __init__(self, max_calls, period):
         self.semaphore = Semaphore(max_calls)
@@ -174,8 +103,24 @@ class RateLimiter:
     def release(self):
         self.semaphore.release()
 
-# Add this dictionary to store rate limiters for each model
+# Dictionary to store rate limiters for each model
 rate_limiters = defaultdict(lambda: RateLimiter(max_calls=2, period=60))
+
+# Function to clean translation output
+def clean_translation_output(output: str) -> str:
+    patterns_to_remove = [
+        r"^.*?Translation:\s*",
+        r"^.*?The translation is:\s*",
+        r"^.*?Translated text:\s*",
+        r"^.*?Here is the translation:\s*",
+        r"Please provide more context.*",
+        r"If you provide more context.*",
+        r"^.*?Explanation:\s*",
+        r"^.*?Note:\s*",
+    ]
+    for pattern in patterns_to_remove:
+        output = re.sub(pattern, '', output, flags=re.IGNORECASE | re.DOTALL)
+    return output.strip()
 
 # Modify the translate_chunk function
 async def translate_chunk(session, chunk: str, source_lang: str, target_lang: str, model: str, retries: int = 3) -> str:
@@ -188,16 +133,16 @@ async def translate_chunk(session, chunk: str, source_lang: str, target_lang: st
         for attempt in range(retries):
             try:
                 if model == 'google_gemini':
-                    print(f"Translating chunk with Google Gemini: {chunk[:100]}...")
+                    logging.info(f"Translating chunk with Google Gemini.")
                     translated_chunk = await google_gemini_translate(session, chunk, source_lang, target_lang)
                 elif model == 'openai':
-                    print(f"Translating chunk with OpenAI: {chunk[:100]}...")
+                    logging.info(f"Translating chunk with OpenAI.")
                     translated_chunk = await openai_translate(chunk, source_lang, target_lang)
                 elif model == 'claude_sonnet':
                     translated_chunk = await claude_sonnet_translate(session, chunk, source_lang, target_lang)
                 else:
                     raise ValueError('Invalid model selected.')
-                
+
                 logging.info(f"Translation result (attempt {attempt + 1}): {translated_chunk[:100]}...")
                 if translated_chunk.strip():
                     return translated_chunk
@@ -205,12 +150,12 @@ async def translate_chunk(session, chunk: str, source_lang: str, target_lang: st
                     logging.warning(f"Empty translation result on attempt {attempt + 1}. Retrying...")
             except Exception as e:
                 logging.error(f"Error during translation (attempt {attempt + 1}/{retries}): {e}")
-            
+
             if attempt < retries - 1:
                 wait_time = 2 ** attempt
                 logging.info(f"Retrying in {wait_time} seconds...")
                 await asyncio.sleep(wait_time)
-        
+
         logging.error("Maximum retries reached. Returning empty string.")
         return ''
     finally:
@@ -218,31 +163,33 @@ async def translate_chunk(session, chunk: str, source_lang: str, target_lang: st
 
 async def google_gemini_translate(session, text: str, source_lang: str, target_lang: str) -> str:
     prompt = f"""
-    Translate the following {source_lang} text to {target_lang}. Do not add any explanations or notes, just provide the translation:
+Please translate the following text from {source_lang} to {target_lang}:
 
-    {text}
+{text}
 
-    Translation:
-    """
+Provide only the translation in {target_lang} without any explanations or additional text.
+"""
     try:
-        response = model.generate_content(prompt, generation_config=genai.types.GenerationConfig(
-            max_output_tokens=4000,
-            temperature=0.2,
-            top_p=0.95,
-            top_k=40
-        ),
-        safety_settings={
-            HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-            HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE
-        })
-        
+        response = gemini_model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                max_output_tokens=4000,
+                temperature=0,
+                top_p=1.0,
+                top_k=0,
+            ),
+            safety_settings={
+                HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
+                HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE
+            }
+        )
+
         if response.text:
             translated_text = response.text.strip()
-            # Remove any potential prefixes like "Translation:" or "Here's the translation:"
-            translated_text = re.sub(r'^(Translation:|Here\'s the translation:)\s*', '', translated_text, flags=re.IGNORECASE)
-            logging.info(f"Raw translation result: {translated_text[:100]}...")  # Log the raw result
+            translated_text = clean_translation_output(translated_text)
+            logging.info(f"Raw translation result: {translated_text[:100]}...")
             return translated_text
         else:
             logging.error("Empty response from Gemini API")
@@ -254,25 +201,13 @@ async def google_gemini_translate(session, text: str, source_lang: str, target_l
 async def openai_translate(text: str, source_lang: str = 'Arabic', target_lang: str = 'English'):
     OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
     client = OpenAI(api_key=OPENAI_API_KEY)
-
     try:
         completion = await asyncio.to_thread(
             client.chat.completions.create,
             model="gpt-4o",
             messages=[
-                {"role": "system", "content": f"You are an expert translator specializing in "
-                                              f"{source_lang} to {target_lang} translations. "
-                                              f"Your task is to provide accurate, nuanced, and "
-                                              f"contextually appropriate translations while "
-                                              f"preserving the original meaning, tone, and style "
-                                              f"of the text."},
-                {"role": "user", "content": f"Translate the following {source_lang} text to "
-                                            f"{target_lang}. Ensure that you maintain the "
-                                            f"original meaning, context, and nuances. If there "
-                                            f"are any idioms, cultural references, or ambiguous "
-                                            f"terms, provide the most appropriate translation "
-                                            f"while preserving the intended meaning:\n\n{text}\n\n"
-                                            f"Translation:"}
+                {"role": "system", "content": f"You are an expert translator specializing in translating text from {source_lang} to {target_lang}. You provide only the translation without any explanations, notes, or additional content."},
+                {"role": "user", "content": f"Please translate the following text from {source_lang} to {target_lang}:\n\n{text}\n\nProvide only the translation in {target_lang} and nothing else."}
             ]
         )
         return completion.choices[0].message.content
@@ -281,7 +216,7 @@ async def openai_translate(text: str, source_lang: str = 'Arabic', target_lang: 
         raise
 
 async def claude_sonnet_translate(session, text: str, source_lang: str, target_lang: str) -> str:
-    # Implement the actual asynchronous API call to Claude Sonnet 3.5 here
+    # Implement the actual asynchronous API call to Claude Sonnet here
     # Placeholder implementation
     return text  # Replace with actual translation
 
@@ -295,6 +230,7 @@ def save_as_text(translated_text: str, output_path: str):
 
 def save_as_word(translated_text: str, output_path: str):
     try:
+        from docx import Document
         document = Document()
         for paragraph in translated_text.split('\n'):
             document.add_paragraph(paragraph)
@@ -305,6 +241,10 @@ def save_as_word(translated_text: str, output_path: str):
 
 def save_as_pdf(translated_text: str, output_path: str):
     try:
+        from reportlab.pdfgen import canvas
+        from reportlab.lib.pagesizes import letter
+        import io
+
         packet = io.BytesIO()
         can = canvas.Canvas(packet, pagesize=letter)
         textobject = can.beginText()
@@ -331,7 +271,6 @@ async def main():
     parser.add_argument('--max_tokens', type=int, help='Maximum tokens per chunk.')
     parser.add_argument('--overlap', type=int, default=2, help='Number of sentences to overlap between chunks.')
     parser.add_argument('--retries', type=int, default=3, help='Number of retries for failed API calls.')
-    parser.add_argument('--autonomous', action='store_true', help='Run in autonomous mode without manual confirmations.')
     args = parser.parse_args()
 
     logging.info(f"Current working directory: {os.getcwd()}")
@@ -342,38 +281,24 @@ async def main():
         logging.error(f"Cannot access the file {full_path}.")
         return
 
+    # Load and extract text from PDF
     logging.info("Extracting text from PDF...")
     try:
-        full_text = extract_text_from_pdf(args.pdf_path)
-        pages = full_text.split('\f')
-        total_pages = len(pages)
-        logging.info(f"Extracted {total_pages} pages from PDF")
+        # Implement your PDF text extraction logic here
+        # For placeholder, we'll read text from a file
+        with open(full_path, 'r', encoding='utf-8') as f:
+            full_text = f.read()
 
-        batch_size = 2
+        sentences = split_text_into_sentences(full_text)
+        chunks = chunk_text(sentences, args.max_tokens - 500 if args.max_tokens else 1548, args.overlap)
+
         translated_text = ""
-        
-        for i in range(0, total_pages, batch_size):
-            batch_pages = pages[i:i+batch_size]
-            batch_text = '\f'.join(batch_pages)
-            
-            logging.info(f"Processing batch {i//batch_size + 1} of {(total_pages-1)//batch_size + 1} (pages {i+1}-{min(i+batch_size, total_pages)})")
 
-            sentences = split_text_into_sentences(batch_text)
-            chunks = chunk_text(sentences, args.max_tokens - 500 if args.max_tokens else 1548, args.overlap)
+        async with aiohttp.ClientSession() as session:
+            tasks = [translate_chunk(session, chunk, args.source_lang, args.target_lang, args.model, args.retries) for chunk in chunks]
+            translated_chunks = await tqdm_asyncio.gather(*tasks, desc="Translating")
 
-            async with aiohttp.ClientSession() as session:
-                tasks = [translate_chunk(session, chunk, args.source_lang, args.target_lang, args.model, args.retries) for chunk in chunks]
-                batch_translated_chunks = await tqdm_asyncio.gather(*tasks, desc=f"Translating batch {i//batch_size + 1}")
-
-            batch_translated_text = '\n'.join(batch_translated_chunks)
-            translated_text += batch_translated_text + '\n\n'
-
-            # Periodic progress update
-            if (i//batch_size + 1) % 5 == 0 or i + batch_size >= total_pages:
-                logging.info(f"Progress: {min(i + batch_size, total_pages)}/{total_pages} pages translated")
-
-            # Add a delay between batches to limit the rate
-            await asyncio.sleep(5)
+        translated_text = '\n'.join(translated_chunks)
 
         if not args.output_path:
             base_name = os.path.splitext(os.path.basename(args.pdf_path))[0]
